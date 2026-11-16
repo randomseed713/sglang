@@ -4,8 +4,12 @@ import argparse
 import hashlib
 import json
 import os
+import shlex
+import shutil
 import subprocess
 import sys
+import sysconfig
+import tarfile
 import tempfile
 from pathlib import Path
 
@@ -18,9 +22,145 @@ def run(command, log, env):
         )
 
 
+def kernel_graph(root, directory, env, log):
+    """Configure the same upstream targets without running the wheel installer."""
+    import torch
+    from torch.utils import cmake_prefix_path
+
+    assert torch.__version__ == "2.13.0+cu129", torch.__version__
+    assert torch.version.cuda == "12.9", torch.version.cuda
+    command = [
+        "cmake",
+        "-S",
+        str(root / "python/sglang/kernels/aot"),
+        "-B",
+        str(directory),
+        "-G",
+        "Ninja",
+        "-DCMAKE_BUILD_TYPE=Release",
+        f"-DPython_EXECUTABLE={sys.executable}",
+        f"-DPython3_EXECUTABLE={sys.executable}",
+        f"-DPython_INCLUDE_DIR={sysconfig.get_path('include')}",
+        f"-DPython3_INCLUDE_DIR={sysconfig.get_path('include')}",
+        "-DSKBUILD_SABI_VERSION=3.11",
+        "-DSKBUILD_SABI_COMPONENT=Development.SABIModule",
+        f"-DCMAKE_PREFIX_PATH={cmake_prefix_path}",
+    ] + shlex.split(env["CMAKE_ARGS"])
+    run(command, log, env)
+    database = json.loads(
+        subprocess.check_output(
+            ["ninja", "-C", str(directory), "-t", "compdb", "-x"], env=env, text=True
+        )
+    )
+    return {item["output"]: item["command"] for item in database if item["command"]}
+
+
+def checksum(path):
+    with path.open("rb") as source:
+        return hashlib.file_digest(source, "sha256").hexdigest()
+
+
+def kernel_objects(root, directory, env, logs, index, count):
+    graph = kernel_graph(root, directory, env, logs / "kernel-configure.log")
+    objects = sorted(name for name in graph if name.endswith(".o"))[index::count]
+    if not objects:
+        raise ValueError("Kernel shard contains no objects")
+    run(
+        [
+            "ninja",
+            "-C",
+            str(directory),
+            "-j",
+            env["CMAKE_BUILD_PARALLEL_LEVEL"],
+            *objects,
+        ],
+        logs / "kernel-objects.log",
+        env,
+    )
+    manifest = {
+        "commit": subprocess.check_output(
+            ["git", "-C", str(root), "rev-parse", "HEAD"], text=True
+        ).strip(),
+        "python": list(sys.version_info[:2]),
+        "index": index,
+        "count": count,
+        "objects": {
+            name: {
+                "sha256": checksum(directory / name),
+                "command_sha256": hashlib.sha256(graph[name].encode()).hexdigest(),
+            }
+            for name in objects
+        },
+    }
+    archive = logs / f"kernel-objects-{index}.tar.gz"
+    with tempfile.TemporaryDirectory(dir=logs) as temporary:
+        metadata = Path(temporary) / "manifest.json"
+        metadata.write_text(json.dumps(manifest))
+        with tarfile.open(archive, "w:gz", compresslevel=1) as tar:
+            tar.add(metadata, arcname="manifest.json")
+            for name in objects:
+                tar.add(directory / name, arcname=f"objects/{name}")
+    print(f"Built {len(objects)} objects: {archive}", flush=True)
+
+
+def assemble_kernel(root, directory, env, logs, archives, count):
+    graph = kernel_graph(root, directory, env, logs / "kernel-configure.log")
+    expected = {name for name in graph if name.endswith(".o")}
+    commit = subprocess.check_output(
+        ["git", "-C", str(root), "rev-parse", "HEAD"], text=True
+    ).strip()
+    seen, indices = set(), set()
+    for archive in sorted(archives.rglob("kernel-objects-*.tar.gz")):
+        with tarfile.open(archive) as tar:
+            manifest = json.load(tar.extractfile("manifest.json"))
+            assert manifest["commit"] == commit, archive
+            assert manifest["python"] == list(sys.version_info[:2]), archive
+            assert manifest["count"] == count, archive
+            assert manifest["index"] not in indices, archive
+            indices.add(manifest["index"])
+            for name, record in manifest["objects"].items():
+                assert name in expected and name not in seen, name
+                assert (
+                    record["command_sha256"]
+                    == hashlib.sha256(graph[name].encode()).hexdigest()
+                ), name
+                destination = directory / name
+                assert destination.resolve().is_relative_to(directory.resolve()), name
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                member = tar.getmember(f"objects/{name}")
+                assert member.isfile(), name
+                with (
+                    tar.extractfile(member) as source,
+                    destination.open("wb") as target,
+                ):
+                    shutil.copyfileobj(source, target)
+                assert checksum(destination) == record["sha256"], name
+                seen.add(name)
+    assert indices == set(range(count)), indices
+    assert seen == expected, expected - seen
+    # Link exactly the upstream commands after verifying every object's source
+    # commit, Python version, compiler command and content checksum.
+    with (logs / "kernel-link.log").open("w") as output:
+        for name, command in graph.items():
+            if name.endswith(".so"):
+                (directory / name).parent.mkdir(parents=True, exist_ok=True)
+                subprocess.run(
+                    command,
+                    cwd=directory,
+                    env=env,
+                    shell=True,
+                    stdout=output,
+                    stderr=subprocess.STDOUT,
+                    check=True,
+                )
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=Path("build/cu129/dist"))
+    parser.add_argument("--kernel-shard", type=int)
+    parser.add_argument("--kernel-shards", type=int, default=8)
+    parser.add_argument("--assemble-kernel", type=Path)
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     output = args.output.resolve()
@@ -40,6 +180,23 @@ def main():
     env["CMAKE_ARGS"] = env.get("CMAKE_ARGS", "") + (
         f" -DSGL_KERNEL_COMPILE_THREADS={threads}"
     )
+    directory = logs / "kernel-build"
+    if args.kernel_shard is not None:
+        if not 0 <= args.kernel_shard < args.kernel_shards:
+            parser.error("Invalid kernel shard index")
+        kernel_objects(
+            root, directory, env, logs, args.kernel_shard, args.kernel_shards
+        )
+        return
+    if args.assemble_kernel:
+        assemble_kernel(
+            root,
+            directory,
+            env,
+            logs,
+            args.assemble_kernel.resolve(),
+            args.kernel_shards,
+        )
     run(
         [
             sys.executable,
@@ -64,7 +221,11 @@ def main():
             str(output),
         ]
         if name == "sglang_kernel":
-            command += ["-Cbuild-dir=" + str(logs / "kernel-build")]
+            command += ["-Cbuild-dir=" + str(directory)]
+            if args.assemble_kernel:
+                # Objects and libraries were built above. Let the normal wheel
+                # backend configure/install/package without compiling them again.
+                command += ["-Cbuild.tool-args=-n"]
         run(command + [str(package)], logs / f"{name}-build.log", env)
         wheel = next(output.glob(f"{name}-*+cu129-*.whl"))
         if name == "sglang_kernel":

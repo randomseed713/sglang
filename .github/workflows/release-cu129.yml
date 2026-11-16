@@ -20,7 +20,45 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  compile:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["311", "312"]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Make room for CUDA build image
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+      - name: Build toolchain image
+        run: docker build -f scripts/cu129.Dockerfile --build-arg PYTHON_TAG=cp${{ matrix.python }}-cp${{ matrix.python }} -t sglang-cu129-builder .
+      - name: Compile kernel object shard
+        run: |
+          mkdir -p build/cu129
+          docker run --rm -v "$PWD:/src" sglang-cu129-builder \
+            --kernel-shard ${{ matrix.shard }} --kernel-shards 8
+      - name: Preserve build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cu129-cp${{ matrix.python }}-shard-${{ matrix.shard }}-logs
+          path: build/cu129/*.log
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cu129-cp${{ matrix.python }}-objects-${{ matrix.shard }}
+          path: build/cu129/kernel-objects-*.tar.gz
+          compression-level: 0
+          if-no-files-found: error
+
   build:
+    needs: compile
     runs-on: ubuntu-22.04
     timeout-minutes: 350
     strategy:
@@ -38,10 +76,16 @@ jobs:
           df -h /
       - name: Build toolchain image
         run: docker build -f scripts/cu129.Dockerfile --build-arg PYTHON_TAG=cp${{ matrix.python }}-cp${{ matrix.python }} -t sglang-cu129-builder .
-      - name: Compile wheels
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: cu129-cp${{ matrix.python }}-objects-*
+          path: parts
+          merge-multiple: true
+      - name: Verify objects, link kernel and build wheels
         run: |
           mkdir -p build/cu129
-          docker run --rm -v "$PWD:/src" sglang-cu129-builder
+          docker run --rm -v "$PWD:/src" sglang-cu129-builder \
+            --assemble-kernel /src/parts --kernel-shards 8
       - name: Verify checksums and wheel metadata
         run: |
           cd build/cu129/dist
@@ -57,8 +101,8 @@ jobs:
                   assert 'torch==2.13.0+cu129' in parsed.get_all('Requires-Dist')
                   print(wheel, parsed['Version'])
           PY
-          mv SHA256SUMS SHA256SUMS-cp${{ matrix.python }}.txt
-          mv build-manifest.json build-manifest-cp${{ matrix.python }}.json
+          sudo mv SHA256SUMS SHA256SUMS-cp${{ matrix.python }}.txt
+          sudo mv build-manifest.json build-manifest-cp${{ matrix.python }}.json
       - name: Preserve build logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -109,7 +153,7 @@ jobs:
 
           DeepGEMM and newer-GPU-only backends are outside the supported L20 inference path. Older drivers require a separately configured NVIDIA forward-compatibility package; the wheels do not install a driver.
 
-          This GitHub-hosted job has no GPU: successful compilation is not an L20 inference test. See scripts/CU129.md for the locally verified setup and inference command.
+          GitHub-hosted build jobs have no GPU. Publication additionally requires a passing L20 inference commit status. See scripts/CU129.md for the locally verified setup and inference command.
           EOF
           gh release create "$RELEASE_TAG" dist/*/* --target "$SOURCE_SHA" \
             --title "SGLang 0.5.23 / CUDA 12.9 (build $GITHUB_RUN_NUMBER)" \
