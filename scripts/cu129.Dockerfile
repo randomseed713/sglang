@@ -4,6 +4,8 @@ FROM pytorch/manylinux2_28-builder:cuda12.9@sha256:d26cd7a9489b53310296e86042de6
 ARG PYTHON_TAG=cp311-cp311
 ENV PATH=/opt/python/${PYTHON_TAG}/bin:/root/.cargo/bin:/usr/local/cuda/bin:$PATH \
     CUDA_HOME=/usr/local/cuda \
+    CPLUS_INCLUDE_PATH=/usr/local/cuda/include/cccl \
+    C_INCLUDE_PATH=/usr/local/cuda/include/cccl \
     CMAKE_BUILD_PARALLEL_LEVEL=4 \
     CARGO_BUILD_JOBS=4 \
     MAX_JOBS=4 \
@@ -11,6 +13,7 @@ ENV PATH=/opt/python/${PYTHON_TAG}/bin:/root/.cargo/bin:/usr/local/cuda/bin:$PAT
 
 RUN yum install -y numactl-devel libibverbs-devel openssl-devel \
     && yum clean all \
+    && ln -sf /usr/local/cuda/targets/x86_64-linux/lib/stubs/libcuda.so /usr/lib64/libcuda.so \
     && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup.sh \
     && sh /tmp/rustup.sh -y --profile minimal --default-toolchain 1.99.1 \
     && rm /tmp/rustup.sh
