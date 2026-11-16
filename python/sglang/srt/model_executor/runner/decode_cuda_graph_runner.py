@@ -608,6 +608,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return max_num_tokens
 
     def _forks_draft_metadata_prep(self) -> bool:
+        if not (
+            envs.SGLANG_OPT_DSV41_DSPARK_DRAFT_PREP_FORK.get()
+            and self.model_runner.spec_algorithm.is_dspark()
+            and self.model_runner.is_draft_worker
+            and self.capture_forward_mode == ForwardMode.TARGET_VERIFY
+        ):
+            return False
+
         from sglang.srt.layers.attention.deepseek_v4_backend import (
             DeepseekV4AttnBackend,
         )
@@ -616,12 +624,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
 
         return (
-            envs.SGLANG_OPT_DSV41_DSPARK_DRAFT_PREP_FORK.get()
             # The unified-KV store location is not a join point.
-            and not is_unified_kv_triton()
-            and self.model_runner.spec_algorithm.is_dspark()
-            and self.model_runner.is_draft_worker
-            and self.capture_forward_mode == ForwardMode.TARGET_VERIFY
+            not is_unified_kv_triton()
             # Its KV store-location reads are where the forked prep joins.
             and isinstance(self.attn_backend, DeepseekV4AttnBackend)
             and self.device_module is torch.cuda
