@@ -49,7 +49,9 @@ jobs:
       - name: Compile kernel object shard
         run: |
           mkdir -p build/cu129
-          docker run --rm -v "$PWD:/src" sglang-cu129-builder \
+          docker run --rm --memory=12g --memory-swap=24g \
+            -e CMAKE_BUILD_PARALLEL_LEVEL=1 -e MAX_JOBS=1 \
+            -v "$PWD:/src" sglang-cu129-builder \
             --kernel-shard ${{ matrix.shard }} --kernel-shards 8
       - name: Preserve build logs
         if: always()
