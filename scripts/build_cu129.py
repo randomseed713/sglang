@@ -65,18 +65,30 @@ def kernel_objects(root, directory, env, logs, index, count):
     objects = sorted(name for name in graph if name.endswith(".o"))[index::count]
     if not objects:
         raise ValueError("Kernel shard contains no objects")
-    run(
-        [
-            "ninja",
-            "-C",
-            str(directory),
-            "-j",
-            env["CMAKE_BUILD_PARALLEL_LEVEL"],
-            *objects,
-        ],
-        logs / "kernel-objects.log",
-        env,
-    )
+    jobs = int(env["CMAKE_BUILD_PARALLEL_LEVEL"])
+    while True:
+        log = logs / "kernel-objects.log"
+        try:
+            run(["ninja", "-C", str(directory), "-j", str(jobs), *objects], log, env)
+            break
+        except subprocess.CalledProcessError:
+            failure = log.read_text(errors="replace")
+            memory_failure = any(
+                marker in failure
+                for marker in (
+                    "died due to signal 9",
+                    "fatal error: Killed",
+                    "out of memory",
+                )
+            )
+            if jobs == 1 or not memory_failure:
+                raise
+            log.rename(log.with_name(f"kernel-objects-j{jobs}.log"))
+            jobs = max(1, jobs // 2)
+            print(
+                f"Compiler was killed; retrying unfinished objects with {jobs} jobs",
+                flush=True,
+            )
     manifest = {
         "commit": subprocess.check_output(
             ["git", "-C", str(root), "rev-parse", "HEAD"], text=True
