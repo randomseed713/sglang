@@ -14,6 +14,7 @@ ENV PATH=/opt/python/${PYTHON_TAG}/bin:/root/.cargo/bin:/usr/local/cuda/bin:$PAT
 RUN yum install -y numactl-devel libibverbs-devel openssl-devel \
     && yum clean all \
     && ln -sf /usr/local/cuda/targets/x86_64-linux/lib/stubs/libcuda.so /usr/lib64/libcuda.so \
+    && git config --global --add safe.directory /src \
     && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup.sh \
     && sh /tmp/rustup.sh -y --profile minimal --default-toolchain 1.99.1 \
     && rm /tmp/rustup.sh
