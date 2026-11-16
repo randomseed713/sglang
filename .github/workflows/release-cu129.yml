@@ -77,11 +77,24 @@ jobs:
     runs-on: ubuntu-22.04
     permissions:
       contents: write
+      statuses: read
     steps:
       - uses: actions/download-artifact@v4
         with:
           pattern: cu129-cp*-wheels
           path: dist
+      - name: Require L20 inference validation of this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          state=$(gh api "repos/$GH_REPO/commits/$SOURCE_SHA/status" \
+            --jq '[.statuses[] | select(.context == "L20 inference / cu129")][0].state')
+          if [ "$state" != success ]; then
+            echo "L20 inference / cu129 must pass for $SOURCE_SHA before publication (state: $state)."
+            exit 1
+          fi
       - name: Publish versioned GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
